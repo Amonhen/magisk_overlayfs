@@ -13,19 +13,6 @@ using namespace std;
 #define MAKEDIR(s) \
     if (std::find(mountpoint.begin(), mountpoint.end(), "/" s) != mountpoint.end()) { \
         mkdir(std::string(tmp_dir + "/" s).data(), 0755); \
-        if ((dirfp = opendir("/" s)) != nullptr) { \
-            char buf[4098]; \
-            struct stat st; \
-            while ((dp = readdir(dirfp)) != nullptr) { \
-                snprintf(buf, sizeof(buf) - 1, "/" s "/%s", dp->d_name); \
-                if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0 || \
-                lstat(buf, &st) != 0 || !S_ISDIR(st.st_mode)) \
-                    continue; \
-                mkdir(std::string(tmp_dir + buf).data(), 0755); \
-                mount_list.push_back(buf); \
-            } \
-            closedir(dirfp); \
-        } \
     }
 
 #define CLEANUP \
@@ -90,9 +77,6 @@ int main(int argc, const char **argv) {
     std::vector<string> mountpoint;
     std::vector<mount_info> mountinfo;
 
-    // list of directories should be mounted!
-    std::vector<string> mount_list;
-
     log_fd = open("/cache/overlayfs.log", O_RDWR | O_CREAT | O_APPEND, 0666);
 
     tmp_dir = std::string("/mnt/") + "overlayfs_" + random_strc(20);
@@ -137,9 +121,6 @@ int main(int argc, const char **argv) {
         mountinfo.emplace_back(system);
         mountpoint.emplace_back("/system");
     }
-    
-    DIR *dirfp;
-    struct dirent *dp;
 
     MAKEDIR("system")
     MAKEDIR("vendor")
@@ -149,94 +130,13 @@ int main(int argc, const char **argv) {
     mountpoint.clear();
 
     LOGI("** Prepare mounts\n");
-    // mount overlayfs for subdirectories of /system /vendor /product /system_ext
+    // mount overlayfs for root of /system /vendor /product /system_ext and restore stock mounts if possible
     std::reverse(mountinfo.begin(), mountinfo.end());
-    for (auto &info : mount_list) {
-        struct stat st;
-        if (stat(info.data(), &st))
-            continue;
-        std::string tmp_mount = tmp_dir + info;
-
-        std::string upperdir = std::string(argv[1]) + "/upper" + info;
-        std::string workerdir = std::string(argv[1]) + "/worker" + info;
-        std::string masterdir = std::string(argv[1]) + "/master" + info;
-        char *con;
-        {
-            char *s = strdup(info.data());
-            char *ss = s;
-            while ((ss = strchr(ss, '/')) != nullptr) {
-                ss[0] = '\0';
-                auto sub = std::string(argv[1]) + "/upper" + s;
-                if (mkdir(sub.data(), 0755) == 0 && getfilecon(s, &con) >= 0) {
-                    LOGD("clone attr [%s] from [%s]\n", con, s);
-                    chown(sub.data(), getuidof(s), getgidof(s));
-                    chmod(sub.data(), getmod(s));
-                    setfilecon(sub.data(), con);
-                    freecon(con);
-                }
-                ss[0] = '/';
-                ss++;
-            }
-            free(s);
-        };
-        
-        {
-            if (mkdir(upperdir.data(), 0755) == 0 && getfilecon(info.data(), &con) >= 0) {
-                LOGD("clone attr [%s] from [%s]\n", con, info.data());
-                chown(upperdir.data(), getuidof(info.data()), getgidof(info.data()));
-                chmod(upperdir.data(), getmod(info.data()));
-                setfilecon(upperdir.data(), con);
-                freecon(con);
-            }
-            mkdirs(workerdir.data(), 0755);
-
-            if (!is_dir(upperdir.data()) ||
-                !is_dir(workerdir.data())) {
-                LOGD("setup upperdir or workdir failed!\n");
-                CLEANUP
-                return 1;
-            }
-        }
-        {
-            std::string opts;
-            opts += "lowerdir=";
-            if (stat(masterdir.data(), &st) == 0 && S_ISDIR(st.st_mode))
-                opts += masterdir + ":";
-            opts += info.data();
-            opts += ",upperdir=";
-            opts += upperdir;
-            opts += ",workdir=";
-            opts += workerdir;
-            
-            // 0 - read-only
-            // 1 - read-write default
-            // 2 - read-only locked
-            
-            if (OVERLAY_MODE == 2 || mount("overlay", tmp_mount.data(), "overlay", ((OVERLAY_MODE == 1)? 0 : MS_RDONLY), opts.data())) {
-                opts = "lowerdir=";
-                opts += upperdir;
-                opts += ":";
-                if (stat(masterdir.data(), &st) == 0 && S_ISDIR(st.st_mode))
-                    opts += masterdir + ":";
-                opts += info.data();
-                if (mount("overlay", tmp_mount.data(), "overlay", 0, opts.data())) {
-                    LOGW("Unable to add [%s], ignore!\n", info.data());
-                    continue;
-                }
-            }
-        }
-        mountpoint.emplace_back(info);
-    }
-
-    // restore stock mounts if possible
     for (auto &mnt : mountinfo) {
         auto info = mnt.target;
         std::string tmp_mount = tmp_dir + info;
         struct stat st;
-        for (auto &s : mount_list) {
-            // only care about mountpoint under overlayfs mounted subdirectories
-            if (!starts_with(info.data(), string(s + "/").data()))
-               continue;
+        {
             char *con;
             std::string upperdir = std::string(argv[1]) + "/upper" + info;
             std::string workerdir = std::string(argv[1]) + "/worker" + info;
@@ -318,7 +218,6 @@ int main(int argc, const char **argv) {
             
             mount_done:
             mountpoint.emplace_back(info);
-            break;
         }
     }
 
